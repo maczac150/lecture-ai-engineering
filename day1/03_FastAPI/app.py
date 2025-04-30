@@ -6,14 +6,15 @@ import traceback
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 import uvicorn
 import nest_asyncio
 from pyngrok import ngrok
+from batch_service import BatchProcessor
 
 # --- 設定 ---
 # モデル名を設定
-MODEL_NAME = "google/gemma-2-2b-jpn-it"  # お好みのモデルに変更可能です
+MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"  # より高性能なMixtralモデルに変更
 print(f"モデル名を設定: {MODEL_NAME}")
 
 # --- モデル設定クラス ---
@@ -56,9 +57,34 @@ class GenerationResponse(BaseModel):
     generated_text: str
     response_time: float
 
+# バッチ処理用のリクエスト
+class BatchRequest(BaseModel):
+    prompt: str
+    params: Optional[Dict[str, Any]] = None
+
+# バッチ処理のレスポンス
+class BatchSubmitResponse(BaseModel):
+    request_id: str
+    status: str
+    queue_position: int
+
+# バッチ処理の結果取得レスポンス
+class BatchResultResponse(BaseModel):
+    request_id: str
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+# バッチ処理の状態確認レスポンス
+class BatchStatusResponse(BaseModel):
+    queue_size: int
+    processing: bool
+    results_waiting: int
+
 # --- モデル関連の関数 ---
-# モデルのグローバル変数
+# モデルとバッチプロセッサのグローバル変数
 model = None
+batch_processor = None
 
 def load_model():
     """推論用のLLMモデルを読み込む"""
@@ -133,12 +159,19 @@ def extract_assistant_response(outputs, user_prompt):
 # --- FastAPIエンドポイント定義 ---
 @app.on_event("startup")
 async def startup_event():
-    """起動時にモデルを初期化"""
+    """起動時にモデルとバッチプロセッサを初期化"""
+    global model, batch_processor
+    
+    # モデルを読み込む
     load_model_task()  # バックグラウンドではなく同期的に読み込む
     if model is None:
         print("警告: 起動時にモデルの初期化に失敗しました")
     else:
         print("起動時にモデルの初期化が完了しました。")
+        
+        # バッチプロセッサを初期化
+        batch_processor = BatchProcessor(model, batch_size=5, max_wait_time=2.0)
+        print("バッチプロセッサを初期化しました")
 
 @app.get("/")
 async def root():
@@ -148,11 +181,115 @@ async def root():
 @app.get("/health")
 async def health_check():
     """ヘルスチェックエンドポイント"""
-    global model
+    global model, batch_processor
+    status = {
+        "model": "not_loaded" if model is None else "loaded",
+        "model_name": config.MODEL_NAME,
+        "batch_processor": "not_initialized" if batch_processor is None else "initialized"
+    }
+    
     if model is None:
-        return {"status": "error", "message": "No model loaded"}
+        return {"status": "error", "message": "No model loaded", "details": status}
 
-    return {"status": "ok", "model": config.MODEL_NAME}
+    return {"status": "ok", "details": status}
+
+# バッチ処理のエンドポイント
+@app.post("/batch/submit", response_model=BatchSubmitResponse)
+async def submit_batch_request(request: BatchRequest):
+    """バッチ処理用のリクエストを送信する"""
+    global batch_processor, model
+    
+    if model is None or batch_processor is None:
+        raise HTTPException(status_code=503, detail="バッチ処理サービスが利用できません。サーバーが初期化中です。")
+    
+    try:
+        # リクエストをキューに追加
+        params = request.params or {}
+        request_id = batch_processor.add_request(request.prompt, params)
+        
+        # キューの現在の位置を取得
+        queue_size = batch_processor.get_queue_size()
+        
+        return BatchSubmitResponse(
+            request_id=request_id,
+            status="queued",
+            queue_position=queue_size
+        )
+    except Exception as e:
+        print(f"バッチリクエスト送信中にエラーが発生しました: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"バッチリクエストの送信中にエラーが発生しました: {str(e)}")
+
+@app.get("/batch/result/{request_id}", response_model=BatchResultResponse)
+async def get_batch_result(request_id: str, wait: bool = True, timeout: float = 10.0):
+    """バッチ処理の結果を取得する"""
+    global batch_processor
+    
+    if batch_processor is None:
+        raise HTTPException(status_code=503, detail="バッチ処理サービスが利用できません。サーバーが初期化中です。")
+    
+    try:
+        # 結果を取得
+        result = batch_processor.get_result(request_id, wait=wait, timeout=timeout)
+        
+        if result is None:
+            # 結果がまだ利用できない場合
+            return BatchResultResponse(
+                request_id=request_id,
+                status="pending",
+                result=None,
+                error=None
+            )
+        
+        # エラーチェック
+        if "error" in result:
+            return BatchResultResponse(
+                request_id=request_id,
+                status="error",
+                result=None,
+                error=result["error"]
+            )
+        
+        # 成功した場合、応答を抽出
+        try:
+            # 結果からテキストを抽出
+            extracted_text = extract_assistant_response(result, "")
+            
+            return BatchResultResponse(
+                request_id=request_id,
+                status="completed",
+                result={"generated_text": extracted_text},
+                error=None
+            )
+        except Exception as e:
+            print(f"応答抽出中にエラーが発生しました: {e}")
+            return BatchResultResponse(
+                request_id=request_id,
+                status="completed_with_extraction_error",
+                result={"raw_output": str(result)},
+                error=f"応答抽出エラー: {str(e)}"
+            )
+            
+    except Exception as e:
+        print(f"バッチ結果取得中にエラーが発生しました: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"バッチ結果の取得中にエラーが発生しました: {str(e)}")
+
+@app.get("/batch/status", response_model=BatchStatusResponse)
+async def get_batch_status():
+    """バッチ処理の状態を取得する"""
+    global batch_processor
+    
+    if batch_processor is None:
+        raise HTTPException(status_code=503, detail="バッチ処理サービスが利用できません。サーバーが初期化中です。")
+    
+    try:
+        status = batch_processor.get_processing_status()
+        return BatchStatusResponse(**status)
+    except Exception as e:
+        print(f"バッチ状態取得中にエラーが発生しました: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"バッチ状態の取得中にエラーが発生しました: {str(e)}")
 
 # 簡略化されたエンドポイント
 @app.post("/generate", response_model=GenerationResponse)
